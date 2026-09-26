@@ -1,0 +1,5 @@
+Write-Host "Start WeatherGPT services in 3 terminals:"
+Write-Host "1) cd backend; npm install; npm run dev"
+Write-Host "2) cd ml-service; python -m venv .venv; .\\.venv\\Scripts\\Activate.ps1; pip install -r requirements.txt; python train.py; uvicorn main:app --reload --port 8001"
+Write-Host "3) cd ai-service; python -m venv .venv; .\\.venv\\Scripts\\Activate.ps1; pip install -r requirements.txt; uvicorn app.main:app --reload --port 8002"
+Write-Host "4) cd frontend; npm install; npm run dev"
