@@ -1,4 +1,5 @@
 import React, { useEffect, useMemo, useState } from "react";
+import WeatherChat from "./components/WeatherChat";
 
 import { createRoot } from "react-dom/client";
 
@@ -792,161 +793,16 @@ function App() {
           ================================================= */}
 
           <section className="chat-panel panel">
-            <div className="panel-top">
-              <div className="panel-title">
-                <div className="panel-icon chat-icon">
-                  <MessageCircle size={18} />
-                </div>
-
-                <div>
-                  <h3>Ask WeatherGPT</h3>
-
-                  <p>Conversational weather intelligence</p>
-                </div>
-              </div>
-
-              {messages.length > 0 && (
-                <button className="clear-button" onClick={clearChat}>
-                  <RefreshCw size={14} />
-                  New chat
-                </button>
-              )}
-            </div>
-
-            {/* CHAT */}
-
-            <div className="messages">
-              {messages.length === 0 && !loadingHistory && (
-                <div className="empty-chat">
-                  <div className="empty-icon">
-                    <Sparkles size={28} />
-                  </div>
-
-                  <h4>Ask anything about the weather</h4>
-
-                  <p>
-                    I can analyze rain, temperature, wind, travel conditions and
-                    upcoming weather.
-                  </p>
-
-                  <div className="suggestion-list">
-                    <button
-                      onClick={() => setQuestion("Will it rain tomorrow?")}
-                    >
-                      Will it rain tomorrow?
-                    </button>
-
-                    <button
-                      onClick={() => setQuestion("Should I go out on Monday?")}
-                    >
-                      Should I go out Monday?
-                    </button>
-
-                    <button
-                      onClick={() =>
-                        setQuestion("How windy will it be tomorrow?")
-                      }
-                    >
-                      How windy tomorrow?
-                    </button>
-                  </div>
-                </div>
-              )}
-
-              {loadingHistory && (
-                <div className="history-loading">
-                  <RefreshCw size={18} className="spin" />
-                  Restoring conversation...
-                </div>
-              )}
-
-              {messages.map((message, index) => (
-                <div
-                  key={`${message.timestamp}-${index}`}
-                  className={
-                    message.role === "user"
-                      ? "message-row user"
-                      : "message-row assistant"
-                  }
-                >
-                  {message.role === "assistant" && (
-                    <div className="avatar ai-avatar">
-                      <Sparkles size={15} />
-                    </div>
-                  )}
-
-                  <div className="message-wrapper">
-                    <div className="message-name">
-                      {message.role === "user" ? "You" : "WeatherGPT"}
-                    </div>
-
-                    <div className="message-bubble">{message.content}</div>
-
-                    {message.role === "assistant" && message.targetDate && (
-                      <button
-                        className="message-context"
-                        onClick={() => setSelectedDetails(message)}
-                      >
-                        <CalendarDays size={13} />
-
-                        {formatShortDate(message.targetDate)}
-
-                        <ArrowUpRight size={12} />
-                      </button>
-                    )}
-                  </div>
-
-                  {message.role === "user" && (
-                    <div className="avatar user-avatar">You</div>
-                  )}
-                </div>
-              ))}
-
-              {loadingChat && (
-                <div className="message-row assistant">
-                  <div className="avatar ai-avatar">
-                    <Sparkles size={15} />
-                  </div>
-
-                  <div className="message-wrapper">
-                    <div className="message-name">WeatherGPT</div>
-
-                    <div className="message-bubble typing-bubble">
-                      <span></span>
-                      <span></span>
-                      <span></span>
-                    </div>
-                  </div>
-                </div>
-              )}
-            </div>
-
-            {/* CHAT INPUT */}
-
-            <form className="chat-form" onSubmit={askWeatherGPT}>
-              <div className="input-shell">
-                <MessageCircle size={18} />
-
-                <input
-                  value={question}
-                  onChange={(event) => setQuestion(event.target.value)}
-                  placeholder="Ask about rain, travel, temperature..."
-                  disabled={loadingChat}
-                />
-              </div>
-
-              <button
-                type="submit"
-                className="send-button"
-                disabled={loadingChat || !question.trim()}
-              >
-                {loadingChat ? (
-                  <RefreshCw size={19} className="spin" />
-                ) : (
-                  <Send size={19} />
-                )}
-              </button>
-            </form>
+            <WeatherChat
+              messages={messages}
+              question={question}
+              setQuestion={setQuestion}
+              loadingChat={loadingChat}
+              loadingHistory={loadingHistory}
+              askWeatherGPT={askWeatherGPT}
+              clearChat={clearChat}
+              title="WeatherGPT"
+            />
           </section>
 
           {/* =================================================
