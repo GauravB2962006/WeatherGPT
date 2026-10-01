@@ -1,3 +1,25 @@
 .env
 .env.*
 .venv/
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+
+# Environment variables
+.env
+.env.*
+!.env.example
+
+# Node
+node_modules/
+dist/
+# Old ML training datasets
+ml-service/historical_weather_nashik.csv
+ml-service/historical_weather_v2_nashik.csv
+ml-service/historical_weather_v3_nashik.csv
+
+# Old ML metadata
+ml-service/model_metadata.json
+ml-service/model_metadata_v2.json
+ml-service/model_metadata_v3.json

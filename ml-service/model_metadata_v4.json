@@ -1,0 +1,66 @@
+{
+    "project": "WeatherGPT",
+    "model_version": "V4",
+    "model_type": "RandomForestClassifier",
+    "prediction_task": "Predict next-day weather risk",
+    "location": "Nashik, Maharashtra, India",
+    "latitude": 20.0059,
+    "longitude": 73.7897,
+    "timezone": "Asia/Kolkata",
+    "training_start": "2020-01-01",
+    "training_end": "2026-08-31",
+    "data_source": "Open-Meteo Historical Weather API",
+    "features": [
+        "temperature",
+        "humidity",
+        "rainfall",
+        "wind_speed",
+        "pressure",
+        "previous_rainfall",
+        "previous_wind_speed",
+        "previous_humidity",
+        "month",
+        "day_of_year"
+    ],
+    "target": "next_day_risk",
+    "risk_definition": {
+        "High": "Rainfall >= 20 mm OR wind >= 45 km/h OR thunderstorm",
+        "Medium": "Rainfall >= 5 mm OR wind >= 30 km/h OR moderate rain/showers",
+        "Low": "All remaining conditions"
+    },
+    "important_note": "Risk labels are project-defined engineering categories and are not official IMD warning categories.",
+    "method": "Current weather, previous-day weather and seasonal features are used to predict the following day's risk.",
+    "train_test_split": "Chronological 80/20",
+    "parameters": {
+        "n_estimators": 500,
+        "max_depth": 16,
+        "min_samples_split": 4,
+        "min_samples_leaf": 2,
+        "max_features": "sqrt",
+        "class_weight": {
+            "Low": 0.8,
+            "Medium": 1.0,
+            "High": 2.5
+        },
+        "random_state": 42
+    },
+    "metrics": {
+        "accuracy": 0.86652977412731,
+        "macro_precision": 0.7250051860349451,
+        "macro_recall": 0.6506751374560432,
+        "macro_f1": 0.6668777593633085,
+        "high_recall": 0.15789473684210525
+    },
+    "feature_importance": {
+        "rainfall": 0.2910457917579191,
+        "humidity": 0.16742619585837246,
+        "previous_rainfall": 0.1510505305118209,
+        "previous_humidity": 0.09142845300021313,
+        "pressure": 0.08812686129391102,
+        "day_of_year": 0.061595970286387455,
+        "wind_speed": 0.043432714656188136,
+        "temperature": 0.04276774917501105,
+        "previous_wind_speed": 0.03901121310234936,
+        "month": 0.024114520357827518
+    }
+}

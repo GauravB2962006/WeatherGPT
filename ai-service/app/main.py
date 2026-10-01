@@ -1,6 +1,7 @@
 import os
 import re
 import json
+import asyncio
 from datetime import datetime, date, timedelta
 from typing import TypedDict, Any
 
@@ -57,14 +58,14 @@ class State(TypedDict, total=False):
 
     # ML
     features: dict[str, float]
+    ml_features: dict[str, float]
     risk: dict[str, Any]
 
     alert: str | None
 
-    # Final answer
+    # Response
     response: str
 
-    # Frontend helper
     is_weather_related: bool
 
 
@@ -84,7 +85,7 @@ class ChatRequest(BaseModel):
 
 
 # ============================================================
-# GEMINI HELPER
+# GEMINI
 # ============================================================
 
 async def call_gemini(prompt: str):
@@ -114,99 +115,235 @@ async def call_gemini(prompt: str):
         ]
     }
 
-    try:
+    max_attempts = 3
 
-        async with httpx.AsyncClient(timeout=30) as client:
+    for attempt in range(max_attempts):
 
-            response = await client.post(
-                url,
-                headers=headers,
-                json=body
-            )
+        try:
+
+            async with httpx.AsyncClient(
+                timeout=30
+            ) as client:
+
+                response = await client.post(
+                    url,
+                    headers=headers,
+                    json=body
+                )
+
+            # ------------------------------------------------
+            # RATE LIMIT
+            # ------------------------------------------------
+
+            if response.status_code == 429:
+
+                # Do not retry an exhausted/rate-limited Gemini
+                # request. Return immediately so WeatherGPT can
+                # use its deterministic fallback response.
+                print(
+                    "Gemini rate limited (429). "
+                    "Using fallback response."
+                )
+
+                return None
+
+            # ------------------------------------------------
+            # TEMPORARY SERVER ERRORS
+            # ------------------------------------------------
+
+            if response.status_code in [
+                500,
+                502,
+                503,
+                504
+            ]:
+
+                if attempt < max_attempts - 1:
+
+                    wait_time = 2 ** attempt
+
+                    print(
+                        f"Gemini server error "
+                        f"{response.status_code}. "
+                        f"Retrying in {wait_time}s..."
+                    )
+
+                    await asyncio.sleep(
+                        wait_time
+                    )
+
+                    continue
 
             response.raise_for_status()
 
             data = response.json()
 
-        candidates = data.get("candidates", [])
+            candidates = data.get(
+                "candidates",
+                []
+            )
 
-        if not candidates:
+            if not candidates:
+                return None
+
+            parts = (
+                candidates[0]
+                .get("content", {})
+                .get("parts", [])
+            )
+
+            if not parts:
+                return None
+
+            text = parts[0].get("text")
+
+            if text:
+                return text.strip()
+
             return None
 
-        parts = (
-            candidates[0]
-            .get("content", {})
-            .get("parts", [])
-        )
+        except httpx.TimeoutException as error:
 
-        if not parts:
+            if attempt < max_attempts - 1:
+
+                wait_time = 2 ** attempt
+
+                print(
+                    f"Gemini timeout. "
+                    f"Retrying in {wait_time}s..."
+                )
+
+                await asyncio.sleep(
+                    wait_time
+                )
+
+                continue
+
+            print(
+                "Gemini timeout:",
+                str(error)
+            )
+
+        except httpx.RequestError as error:
+
+            if attempt < max_attempts - 1:
+
+                wait_time = 2 ** attempt
+
+                print(
+                    f"Gemini connection error. "
+                    f"Retrying in {wait_time}s..."
+                )
+
+                await asyncio.sleep(
+                    wait_time
+                )
+
+                continue
+
+            print(
+                "Gemini request error:",
+                str(error)
+            )
+
+        except Exception as error:
+
+            print(
+                "Gemini error:",
+                str(error)
+            )
+
             return None
 
-        return parts[0].get("text", "").strip()
-
-    except Exception as error:
-
-        print("Gemini error:", str(error))
-
-        return None
+    return None
 
 
 # ============================================================
-# FALLBACK WEATHER KEYWORDS
+# WEATHER KEYWORDS
 # ============================================================
 
 WEATHER_KEYWORDS = [
+
     "weather",
     "forecast",
+
     "rain",
     "rainfall",
     "raining",
+    "rainy",
     "umbrella",
     "precipitation",
     "shower",
+
     "storm",
+    "storms",
     "thunderstorm",
+    "thunderstorms",
     "lightning",
+
     "cloud",
+    "clouds",
     "cloudy",
+
     "sunny",
     "sunshine",
+
     "temperature",
     "temp",
     "hot",
     "heat",
     "cold",
     "cool",
+
     "humidity",
     "humid",
+
     "wind",
     "windy",
     "breeze",
+
     "pressure",
-    "atmosphere",
+    "atmospheric pressure",
+
     "climate",
     "monsoon",
+
     "cyclone",
-    "tornado",
+    "cyclones",
     "hurricane",
+    "hurricanes",
+    "tornado",
+    "tornadoes",
+
     "snow",
     "snowfall",
+
     "fog",
     "mist",
+
     "hail",
+
     "drought",
     "flood",
+    "flooding",
+
     "heatwave",
     "heat wave",
+
     "coldwave",
     "cold wave",
+
     "dew",
+
     "visibility",
+
     "uv",
     "uv index",
-    "air pressure",
+
     "weather alert",
     "weather warning",
+
+    # Weather-dependent activities
     "outdoor",
     "outside",
     "travel",
@@ -225,20 +362,356 @@ WEATHER_KEYWORDS = [
 
 
 # ============================================================
-# HEURISTIC WEATHER DETECTION
+# WEATHER DETECTION FALLBACK
 # ============================================================
 
-def heuristic_weather_detection(text: str):
+def looks_weather_related(text: str):
 
     lower = text.lower()
 
-    if any(
+    return any(
         keyword in lower
         for keyword in WEATHER_KEYWORDS
-    ):
-        return True
+    )
 
-    return False
+
+# ============================================================
+# QUERY UNDERSTANDING
+# ============================================================
+
+def extract_requested_city(message: str):
+
+    patterns = [
+        r"\bweather\s+(?:in|at|for)\s+([A-Za-z][A-Za-z .'-]{1,40}?)(?:\?|$)",
+        r"\bforecast\s+(?:in|at|for)\s+([A-Za-z][A-Za-z .'-]{1,40}?)(?:\?|$)",
+        r"\b(?:rain|temperature|wind|weather)\s+(?:in|at)\s+([A-Za-z][A-Za-z .'-]{1,40}?)(?:\?|$)"
+    ]
+
+    for pattern in patterns:
+
+        match = re.search(
+            pattern,
+            message,
+            flags=re.IGNORECASE
+        )
+
+        if match:
+
+            city = match.group(1).strip()
+
+            city = re.sub(
+                r"\s+(today|tomorrow|tonight|now)$",
+                "",
+                city,
+                flags=re.IGNORECASE
+            ).strip()
+
+            if city:
+                return city
+
+    return None
+
+
+# ============================================================
+# LOCAL QUERY CLASSIFICATION
+# ============================================================
+
+def local_query_classification(
+    message: str,
+    history: list[dict[str, Any]]
+):
+    """
+    Classify obvious questions locally so Gemini is not
+    unnecessarily called for every message.
+    """
+
+    text = message.lower().strip()
+
+    requested_city = extract_requested_city(message)
+
+    # --------------------------------------------------------
+    # OBVIOUS NON-WEATHER
+    # --------------------------------------------------------
+
+    if not looks_weather_related(text):
+
+        follow_up_phrases = [
+            "what about",
+            "how about",
+            "what about that",
+            "how about that",
+            "that day",
+            "same day",
+            "that date",
+            "next day",
+            "following day",
+            "day after that",
+            "what about the next",
+            "then"
+        ]
+
+        has_follow_up = any(
+            phrase in text
+            for phrase in follow_up_phrases
+        )
+
+        if has_follow_up and history:
+
+            return {
+                "scope": "weather",
+                "query_type": "forecast",
+                "intent": "GENERAL_WEATHER",
+                "requested_city": None,
+                "is_weather_related": True
+            }
+
+        return {
+            "scope": "non_weather",
+            "query_type": "weather_knowledge",
+            "intent": "OUT_OF_SCOPE",
+            "requested_city": None,
+            "is_weather_related": False
+        }
+
+    # --------------------------------------------------------
+    # WEATHER KNOWLEDGE QUESTIONS
+    # --------------------------------------------------------
+
+    knowledge_words = [
+        "what is",
+        "what are",
+        "why does",
+        "why do",
+        "why is",
+        "why are",
+        "how does",
+        "how do",
+        "how is",
+        "how are",
+        "causes",
+        "cause of",
+        "meaning of",
+        "explain",
+        "difference between",
+        "how works",
+        "how does it work"
+    ]
+
+    if any(
+        phrase in text
+        for phrase in knowledge_words
+    ):
+
+        return {
+            "scope": "weather",
+            "query_type": "weather_knowledge",
+            "intent": "WEATHER_KNOWLEDGE",
+            "requested_city": requested_city,
+            "is_weather_related": True
+        }
+
+    # --------------------------------------------------------
+    # FORECAST / ACTUAL WEATHER DATA
+    # --------------------------------------------------------
+
+    forecast_words = [
+        "today",
+        "tomorrow",
+        "tmrw",
+        "tmr",
+        "forecast",
+        "current",
+        "now",
+        "will",
+        "next",
+        "this week",
+        "this weekend",
+        "day after",
+        "yesterday",
+        "tonight",
+        "weather",
+        "weather in",
+        "weather for",
+        "weather at",
+        "temperature today",
+        "temperature tomorrow",
+        "weather today",
+        "weather tomorrow"
+    ]
+
+    if any(
+        word in text
+        for word in forecast_words
+    ):
+
+        return {
+            "scope": "weather",
+            "query_type": "forecast",
+            "intent": "GENERAL_WEATHER",
+            "requested_city": requested_city,
+            "is_weather_related": True
+        }
+
+    # --------------------------------------------------------
+    # RAIN
+    # --------------------------------------------------------
+
+    if any(
+        word in text
+        for word in [
+            "rain",
+            "rainfall",
+            "raining",
+            "rainy",
+            "umbrella",
+            "precipitation",
+            "shower"
+        ]
+    ):
+
+        return {
+            "scope": "weather",
+            "query_type": "forecast",
+            "intent": "RAIN_FORECAST",
+            "requested_city": requested_city,
+            "is_weather_related": True
+        }
+
+    # --------------------------------------------------------
+    # TEMPERATURE
+    # --------------------------------------------------------
+
+    if any(
+        word in text
+        for word in [
+            "temperature",
+            "temp",
+            "hot",
+            "cold",
+            "heat",
+            "cool"
+        ]
+    ):
+
+        return {
+            "scope": "weather",
+            "query_type": "forecast",
+            "intent": "TEMPERATURE",
+            "requested_city": requested_city,
+            "is_weather_related": True
+        }
+
+    # --------------------------------------------------------
+    # WIND
+    # --------------------------------------------------------
+
+    if any(
+        word in text
+        for word in [
+            "wind",
+            "windy",
+            "breeze"
+        ]
+    ):
+
+        return {
+            "scope": "weather",
+            "query_type": "forecast",
+            "intent": "WIND",
+            "requested_city": requested_city,
+            "is_weather_related": True
+        }
+
+    # --------------------------------------------------------
+    # OUTDOOR / TRAVEL ACTIVITIES
+    # --------------------------------------------------------
+
+    if any(
+        word in text
+        for word in [
+            "bike ride",
+            "cycling",
+            "travel",
+            "trip",
+            "journey",
+            "drive",
+            "driving",
+            "walk",
+            "walking",
+            "picnic",
+            "outdoor",
+            "outside",
+            "commute",
+            "commuting"
+        ]
+    ):
+
+        return {
+            "scope": "weather",
+            "query_type": "forecast",
+            "intent": "GENERAL_WEATHER",
+            "requested_city": requested_city,
+            "is_weather_related": True
+        }
+
+    # --------------------------------------------------------
+    # OTHER CLEAR WEATHER KNOWLEDGE TOPICS
+    # --------------------------------------------------------
+
+    if any(
+        word in text
+        for word in [
+            "humidity",
+            "humid",
+            "storm",
+            "storms",
+            "thunderstorm",
+            "thunderstorms",
+            "lightning",
+            "cloud",
+            "clouds",
+            "cloudy",
+            "sunny",
+            "sunshine",
+            "snow",
+            "snowfall",
+            "fog",
+            "mist",
+            "hail",
+            "climate",
+            "monsoon",
+            "cyclone",
+            "cyclones",
+            "hurricane",
+            "hurricanes",
+            "tornado",
+            "tornadoes",
+            "flood",
+            "flooding",
+            "drought",
+            "heatwave",
+            "heat wave",
+            "coldwave",
+            "cold wave",
+            "visibility",
+            "uv",
+            "uv index",
+            "pressure",
+            "atmospheric pressure",
+            "weather alert",
+            "weather warning"
+        ]
+    ):
+
+        return {
+            "scope": "weather",
+            "query_type": "weather_knowledge",
+            "intent": "WEATHER_KNOWLEDGE",
+            "requested_city": requested_city,
+            "is_weather_related": True
+        }
+
+    return None
 
 
 # ============================================================
@@ -249,41 +722,64 @@ async def query_node(state: State):
 
     message = state["message"].strip()
 
-    lower = message.lower()
+    history = state.get(
+        "history",
+        []
+    )
 
-    history = state.get("history", [])
+    # ========================================================
+    # STEP 1 — LOCAL CLASSIFICATION
+    # ========================================================
 
-    # --------------------------------------------------------
-    # First: use Gemini for broad semantic understanding
-    # --------------------------------------------------------
+    local_result = local_query_classification(
+        message,
+        history
+    )
+
+    if local_result is not None:
+
+        print(
+            "Local classifier used:",
+            local_result["scope"],
+            local_result["query_type"],
+            local_result["intent"]
+        )
+
+        return local_result
+
+    # ========================================================
+    # STEP 2 — GEMINI ONLY FOR AMBIGUOUS QUESTIONS
+    # ========================================================
+
+    print(
+        "Gemini classifier used for ambiguous query."
+    )
 
     if GEMINI_API_KEY:
 
-        history_text = ""
-
-        for item in history[-6:]:
-
-            role = item.get("role", "")
-
-            content = item.get("content", "")
-
-            history_text += (
-                f"{role}: {content}\n"
-            )
+        history_text = "\n".join(
+            [
+                f"{item.get('role', '')}: "
+                f"{item.get('content', '')}"
+                for item in history[-6:]
+            ]
+        )
 
         prompt = f"""
-You are the query-understanding system for WeatherGPT.
+You are the query classifier for WeatherGPT.
 
-WeatherGPT is ONLY for weather and weather-related information.
+WeatherGPT is a specialized weather assistant.
 
-Classify the user's question.
+Your job is to decide whether the user's question is
+related to WEATHER.
 
-WEATHER-RELATED QUESTIONS INCLUDE:
+Weather-related questions include:
 
 - Current weather
 - Weather forecasts
 - Rain
 - Rain probability
+- Rainfall
 - Temperature
 - Humidity
 - Wind
@@ -295,76 +791,64 @@ WEATHER-RELATED QUESTIONS INCLUDE:
 - Snow
 - Fog
 - Visibility
-- Pressure
+- Atmospheric pressure
 - UV
 - Monsoon
 - Cyclones
 - Hurricanes
 - Tornadoes
-- Floods caused by weather
+- Floods related to weather
+- Drought
 - Heat waves
 - Cold waves
-- Climate/weather concepts
+- Climate
 - Weather science
 - Weather safety
 - Outdoor activities affected by weather
 - Travel affected by weather
 - Bike rides affected by weather
-- Farming questions where weather is relevant
+- Walking affected by weather
+- Farming questions involving weather
 - What to wear based on weather
 - Weather comparisons
-- Historical/current/future weather questions
+- Historical weather
+- Future weather
 
-NON-WEATHER QUESTIONS INCLUDE:
+If an activity depends on weather, classify it as weather.
 
-- Programming
-- Java
-- C/C++
-- Mathematics
-- General knowledge unrelated to weather
-- Movies
-- Sports unrelated to weather
-- Politics
-- Celebrities
-- Entertainment
-- Coding help
-- Homework unrelated to weather
-- General conversation
-- Jokes
-- Anything unrelated to weather
+For weather questions determine whether it is:
 
-IMPORTANT:
+forecast
 
-A question such as:
-"Can I go for a bike ride tomorrow?"
+OR
 
-IS WEATHER-RELATED because weather affects the activity.
+weather_knowledge
 
-A question such as:
-"What causes thunderstorms?"
+FORECAST means the user needs actual weather data.
 
-IS WEATHER-RELATED even though it is not asking for a forecast.
+WEATHER_KNOWLEDGE means the user wants an explanation
+about weather itself.
 
-A question such as:
-"Who is the Prime Minister?"
+If the question is unrelated to weather, classify it as
+non_weather.
 
-IS NOT WEATHER-RELATED.
+Return ONLY JSON.
 
-Return ONLY valid JSON.
-
-JSON FORMAT:
+Format:
 
 {{
     "scope": "weather" or "non_weather",
     "query_type": "forecast" or "weather_knowledge",
-    "intent": "short descriptive intent",
-    "requested_city": "city name or null"
+    "intent": "SHORT_INTENT_NAME",
+    "requested_city": "CITY_NAME or null"
 }}
 
 USER QUESTION:
+
 {message}
 
 RECENT CONVERSATION:
+
 {history_text}
 """
 
@@ -376,7 +860,6 @@ RECENT CONVERSATION:
 
                 cleaned = result.strip()
 
-                # Remove markdown JSON fences if Gemini adds them
                 cleaned = re.sub(
                     r"^```json\s*",
                     "",
@@ -390,11 +873,13 @@ RECENT CONVERSATION:
                     cleaned
                 )
 
-                parsed = json.loads(cleaned)
+                parsed = json.loads(
+                    cleaned
+                )
 
                 scope = parsed.get(
                     "scope",
-                    "weather"
+                    "non_weather"
                 )
 
                 query_type = parsed.get(
@@ -415,7 +900,7 @@ RECENT CONVERSATION:
                     "weather",
                     "non_weather"
                 ]:
-                    scope = "weather"
+                    scope = "non_weather"
 
                 if query_type not in [
                     "forecast",
@@ -426,26 +911,24 @@ RECENT CONVERSATION:
                 return {
                     "scope": scope,
                     "query_type": query_type,
-                    "intent": intent.upper(),
+                    "intent": str(intent).upper(),
                     "requested_city": requested_city,
-                    "is_weather_related": (
-                        scope == "weather"
-                    )
+                    "is_weather_related": scope == "weather"
                 }
 
             except Exception as error:
 
                 print(
-                    "Query classification error:",
+                    "Classifier JSON error:",
                     str(error)
                 )
 
-    # --------------------------------------------------------
-    # FALLBACK CLASSIFICATION
-    # --------------------------------------------------------
+    # ========================================================
+    # STEP 3 — FINAL LOCAL FALLBACK
+    # ========================================================
 
-    is_weather = heuristic_weather_detection(
-        lower
+    is_weather = looks_weather_related(
+        message
     )
 
     if not is_weather:
@@ -458,27 +941,31 @@ RECENT CONVERSATION:
             "is_weather_related": False
         }
 
-    # Most weather questions without explicit
-    # forecasting words are treated as knowledge.
+    lower = message.lower()
+
     forecast_words = [
         "today",
         "tomorrow",
         "forecast",
+        "current",
+        "now",
         "will",
         "next",
         "this week",
         "this weekend",
         "day after",
-        "weather now",
-        "right now",
-        "current weather",
         "temperature today",
-        "temperature tomorrow"
+        "temperature tomorrow",
+        "weather today",
+        "weather tomorrow"
     ]
 
     query_type = (
         "forecast"
-        if any(word in lower for word in forecast_words)
+        if any(
+            word in lower
+            for word in forecast_words
+        )
         else "weather_knowledge"
     )
 
@@ -486,14 +973,38 @@ RECENT CONVERSATION:
         "scope": "weather",
         "query_type": query_type,
         "intent": "GENERAL_WEATHER",
-        "requested_city": None,
+        "requested_city": extract_requested_city(message),
         "is_weather_related": True
     }
 
 
 # ============================================================
-# DATE UNDERSTANDING
+# DATE HELPERS
 # ============================================================
+
+def get_previous_target_date(
+    history
+):
+
+    for item in reversed(history):
+
+        target = item.get(
+            "targetDate"
+        )
+
+        if target:
+
+            try:
+
+                return date.fromisoformat(
+                    target
+                )
+
+            except:
+                pass
+
+    return None
+
 
 def resolve_weekday(
     text: str,
@@ -501,6 +1012,7 @@ def resolve_weekday(
 ):
 
     weekdays = {
+
         "monday": 0,
         "tuesday": 1,
         "wednesday": 2,
@@ -510,7 +1022,7 @@ def resolve_weekday(
         "sunday": 6
     }
 
-    for name, weekday_number in weekdays.items():
+    for name, number in weekdays.items():
 
         if re.search(
             rf"\b{name}\b",
@@ -518,28 +1030,11 @@ def resolve_weekday(
         ):
 
             days_ahead = (
-                weekday_number
+                number
                 - reference_date.weekday()
             ) % 7
 
-            # If today is the requested weekday,
-            # interpret it as today.
             return days_ahead
-
-    return None
-
-
-def get_previous_target_date(history):
-
-    for item in reversed(history):
-
-        target = item.get("targetDate")
-
-        if target:
-            try:
-                return date.fromisoformat(target)
-            except:
-                pass
 
     return None
 
@@ -547,7 +1042,7 @@ def get_previous_target_date(history):
 def get_forecast_index(
     message: str,
     available_dates: list[str],
-    history: list[dict[str, Any]]
+    history
 ):
 
     text = message.lower().strip()
@@ -558,7 +1053,10 @@ def get_forecast_index(
     # TODAY
     # --------------------------------------------------------
 
-    if re.search(r"\btoday\b", text):
+    if re.search(
+        r"\btoday\b",
+        text
+    ):
 
         return 0
 
@@ -579,8 +1077,15 @@ def get_forecast_index(
     # --------------------------------------------------------
 
     if (
-        re.search(r"\btomorrow\b", text)
-        or re.search(r"\btmrw\b|\btmr\b", text)
+        re.search(
+            r"\btomorrow\b",
+            text
+        )
+
+        or re.search(
+            r"\btmrw\b|\btmr\b",
+            text
+        )
     ):
 
         return 1
@@ -590,6 +1095,7 @@ def get_forecast_index(
     # --------------------------------------------------------
 
     number_words = {
+
         "one": 1,
         "two": 2,
         "three": 3,
@@ -600,7 +1106,9 @@ def get_forecast_index(
     }
 
     match = re.search(
-        r"\bin\s+(\d+|one|two|three|four|five|six|seven)\s+days?\b",
+        r"\bin\s+"
+        r"(\d+|one|two|three|four|five|six|seven)"
+        r"\s+days?\b",
         text
     )
 
@@ -609,37 +1117,48 @@ def get_forecast_index(
         value = match.group(1)
 
         days = (
+
             int(value)
+
             if value.isdigit()
+
             else number_words[value]
         )
 
         return days
 
     # --------------------------------------------------------
-    # FOLLOW-UP: DAY AFTER / NEXT DAY
+    # FOLLOW-UP QUESTIONS
     # --------------------------------------------------------
 
-    previous_target = get_previous_target_date(
-        history
+    previous_target = (
+        get_previous_target_date(
+            history
+        )
     )
 
     if previous_target:
 
+        difference = (
+            previous_target - today
+        ).days
+
         if any(
             phrase in text
+
             for phrase in [
+
                 "day after",
+
                 "next day",
+
                 "following day",
+
                 "day after that",
+
                 "what about the next"
             ]
         ):
-
-            difference = (
-                previous_target - today
-            ).days
 
             return max(
                 difference + 1,
@@ -648,38 +1167,40 @@ def get_forecast_index(
 
         if any(
             phrase in text
+
             for phrase in [
+
                 "that day",
+
                 "same day",
+
                 "that date",
+
                 "what about that",
+
                 "how about that",
+
                 "then"
             ]
         ):
-
-            difference = (
-                previous_target - today
-            ).days
 
             return max(
                 difference,
                 0
             )
 
-        # Generic follow-up
         if any(
             text.startswith(prefix)
+
             for prefix in [
+
                 "what about",
+
                 "how about",
+
                 "and "
             ]
         ):
-
-            difference = (
-                previous_target - today
-            ).days
 
             return max(
                 difference,
@@ -702,27 +1223,34 @@ def get_forecast_index(
     # --------------------------------------------------------
     # DEFAULT
     #
-    # For forecast questions without a date,
-    # use tomorrow.
+    # Only forecast questions reach this node.
+    # If no date is specified, tomorrow remains the
+    # existing project behavior.
     # --------------------------------------------------------
 
     return 1
 
 
 # ============================================================
-# WEATHER API
+# GEOCODING
 # ============================================================
 
 async def geocode(city: str):
 
-    async with httpx.AsyncClient(timeout=10) as client:
+    async with httpx.AsyncClient(
+        timeout=10
+    ) as client:
 
         response = await client.get(
             "https://geocoding-api.open-meteo.com/v1/search",
             params={
+
                 "name": city,
+
                 "count": 1,
+
                 "language": "en",
+
                 "format": "json"
             }
         )
@@ -739,6 +1267,10 @@ async def geocode(city: str):
 
         return data["results"][0]
 
+
+# ============================================================
+# WEATHER API
+# ============================================================
 
 async def weather_for(
     lat: float,
@@ -773,7 +1305,9 @@ async def weather_for(
         "timezone": "auto"
     }
 
-    async with httpx.AsyncClient(timeout=10) as client:
+    async with httpx.AsyncClient(
+        timeout=10
+    ) as client:
 
         response = await client.get(
             "https://api.open-meteo.com/v1/forecast",
@@ -789,84 +1323,191 @@ async def weather_for(
 # WEATHER DATA NODE
 # ============================================================
 
-async def weather_node(state: State):
-
-    requested_city = state.get(
-        "requested_city"
-    )
+async def weather_node(
+    state: State
+):
 
     city = (
-        requested_city
-        or state.get("city")
+
+        state.get(
+            "requested_city"
+        )
+
+        or state.get(
+            "city"
+        )
+
         or "Nashik"
     )
 
-    place = await geocode(city)
+    place = await geocode(
+        city
+    )
 
     data = await weather_for(
+
         place["latitude"],
+
         place["longitude"]
     )
 
-    available_dates = data["daily"]["time"]
+    available_dates = (
+        data["daily"]["time"]
+    )
 
-    requested_index = get_forecast_index(
-        state["message"],
-        available_dates,
-        state.get("history", [])
+    requested_index = (
+        get_forecast_index(
+
+            state["message"],
+
+            available_dates,
+
+            state.get(
+                "history",
+                []
+            )
+        )
     )
 
     forecast_index = min(
-        max(requested_index, 0),
-        len(available_dates) - 1
+
+        max(
+            requested_index,
+            0
+        ),
+
+        len(
+            available_dates
+        ) - 1
     )
 
-    target_date = available_dates[
-        forecast_index
-    ]
+    target_date = (
+        available_dates[
+            forecast_index
+        ]
+    )
 
     location = {
 
-        "name": place["name"],
+        "name":
+            place["name"],
 
-        "country": place.get("country"),
+        "country":
+            place.get("country"),
 
-        "latitude": place["latitude"],
+        "latitude":
+            place["latitude"],
 
-        "longitude": place["longitude"]
+        "longitude":
+            place["longitude"]
     }
 
     return {
 
-        "location": location,
+        "location":
+            location,
 
-        "weather": data,
+        "weather":
+            data,
 
-        "target_date": target_date,
+        "target_date":
+            target_date,
 
-        "forecast_index": forecast_index
+        "forecast_index":
+            forecast_index
     }
 
 
 # ============================================================
-# RISK ANALYSIS
+# HISTORICAL WEATHER FOR V4 PREVIOUS-DAY FEATURES
 # ============================================================
 
-async def risk_node(state: State):
+async def historical_weather_for(
+    lat: float,
+    lon: float,
+    target_date: str
+):
+    """
+    Fetch the previous day's observed/reanalysis weather.
+
+    V4 was trained as a next-day model:
+    day T features -> day T+1 risk.
+
+    Therefore, when predicting tomorrow, the model uses
+    today's weather as the main features and yesterday's
+    weather as the previous-day features.
+    """
+
+    params = {
+        "latitude": lat,
+        "longitude": lon,
+        "start_date": target_date,
+        "end_date": target_date,
+        "daily": (
+            "temperature_2m_max,"
+            "relative_humidity_2m_mean,"
+            "precipitation_sum,"
+            "wind_speed_10m_max,"
+            "surface_pressure_mean"
+        ),
+        "timezone": "auto"
+    }
+
+    async with httpx.AsyncClient(timeout=15) as client:
+        response = await client.get(
+            "https://archive-api.open-meteo.com/v1/archive",
+            params=params
+        )
+
+        response.raise_for_status()
+
+        data = response.json()
+
+    daily = data.get("daily", {})
+
+    if not daily.get("time"):
+        raise ValueError(
+            f"No historical weather data available for {target_date}"
+        )
+
+    def first_value(key: str, default: float = 0.0):
+        values = daily.get(key, [])
+        if not values or values[0] is None:
+            return default
+        return float(values[0])
+
+    return {
+        "temperature": first_value("temperature_2m_max"),
+        "humidity": first_value("relative_humidity_2m_mean"),
+        "rainfall": first_value("precipitation_sum"),
+        "wind_speed": first_value("wind_speed_10m_max"),
+        "pressure": first_value("surface_pressure_mean", 1013.0)
+    }
+
+
+# ============================================================
+# ML RISK ANALYSIS
+# ============================================================
+
+async def risk_node(
+    state: State
+):
 
     weather = state["weather"]
-
     daily = weather["daily"]
-
     index = state["forecast_index"]
+
+    # --------------------------------------------------------
+    # TARGET-DAY WEATHER
+    # These values are used for the user-facing answer.
+    # --------------------------------------------------------
 
     rainfall = float(
         daily["precipitation_sum"][index] or 0
     )
 
     rain_probability = float(
-        daily["precipitation_probability_max"][index]
-        or 0
+        daily["precipitation_probability_max"][index] or 0
     )
 
     wind = float(
@@ -877,70 +1518,204 @@ async def risk_node(state: State):
         daily["temperature_2m_max"][index] or 0
     )
 
-    current = weather.get(
-        "current",
-        {}
-    )
+    current = weather.get("current", {})
 
     humidity = float(
         current.get(
             "relative_humidity_2m",
             0
-        )
-        or 0
+        ) or 0
     )
 
     pressure = float(
         current.get(
             "surface_pressure",
             1013
-        )
-        or 1013
+        ) or 1013
     )
 
     features = {
-
         "temperature": temperature,
-
         "humidity": humidity,
-
         "rainfall": rainfall,
-
         "rain_probability": rain_probability,
-
         "wind_speed": wind,
-
         "pressure": pressure
     }
 
-    try:
+    # --------------------------------------------------------
+    # V4 MODEL FEATURES
+    #
+    # V4 is a NEXT-DAY model trained on Nashik:
+    #
+    # day T features + previous day features
+    #                 -> day T+1 risk
+    #
+    # Therefore we only use V4 for:
+    #   1. Nashik
+    #   2. Tomorrow (forecast index 1)
+    #
+    # For today or dates farther than tomorrow, the V4 model
+    # would not match the training target, so we use the
+    # transparent rule-based fallback instead.
+    # --------------------------------------------------------
 
-        async with httpx.AsyncClient(
-            timeout=10
-        ) as client:
+    location_name = (
+        state.get("location", {}).get("name", "")
+        or ""
+    )
 
-            response = await client.post(
-                f"{ML_SERVICE_URL}/predict",
-                json=features
+    is_nashik = (
+        location_name.strip().lower() == "nashik"
+    )
+
+    can_use_v4 = (
+        is_nashik
+        and index == 1
+    )
+
+    ml_features = {
+        "temperature": temperature,
+        "humidity": humidity,
+        "rainfall": rainfall,
+        "wind_speed": wind,
+        "pressure": pressure,
+        "previous_rainfall": 0.0,
+        "previous_wind_speed": 0.0,
+        "previous_humidity": 0.0,
+        "month": int(
+            date.fromisoformat(
+                state["target_date"]
+            ).month
+        ),
+        "day_of_year": int(
+            date.fromisoformat(
+                state["target_date"]
+            ).timetuple().tm_yday
+        )
+    }
+
+    risk = None
+
+    # --------------------------------------------------------
+    # V4 NEXT-DAY PREDICTION
+    # --------------------------------------------------------
+
+    if can_use_v4:
+
+        try:
+
+            target = date.fromisoformat(
+                state["target_date"]
             )
 
-            response.raise_for_status()
+            previous_date = (
+                target - timedelta(days=2)
+            )
 
-            risk = response.json()
+            # Example:
+            # target = tomorrow
+            # model input day T = today
+            # previous day = yesterday
+            #
+            # Since target is T+1, the previous feature date
+            # is target - 2 days.
+            previous = await historical_weather_for(
+                state["location"]["latitude"],
+                state["location"]["longitude"],
+                previous_date.isoformat()
+            )
 
-    except Exception as error:
+            # For the day T features, use today's forecast/current
+            # weather because the model predicts T+1.
+            day_t_index = 0
 
-        print(
-            "ML service error:",
-            str(error)
-        )
+            day_t_rainfall = float(
+                daily["precipitation_sum"][day_t_index] or 0
+            )
 
-        # Safe fallback if ML service is temporarily unavailable.
+            day_t_wind = float(
+                daily["wind_speed_10m_max"][day_t_index] or 0
+            )
+
+            day_t_temperature = float(
+                daily["temperature_2m_max"][day_t_index] or 0
+            )
+
+            day_t_humidity = float(
+                current.get(
+                    "relative_humidity_2m",
+                    0
+                ) or 0
+            )
+
+            day_t_pressure = float(
+                current.get(
+                    "surface_pressure",
+                    1013
+                ) or 1013
+            )
+
+            ml_features = {
+                "temperature": day_t_temperature,
+                "humidity": day_t_humidity,
+                "rainfall": day_t_rainfall,
+                "wind_speed": day_t_wind,
+                "pressure": day_t_pressure,
+                "previous_rainfall": previous["rainfall"],
+                "previous_wind_speed": previous["wind_speed"],
+                "previous_humidity": previous["humidity"],
+                "month": int(target.month),
+                "day_of_year": int(
+                    target.timetuple().tm_yday
+                )
+            }
+
+            async with httpx.AsyncClient(
+                timeout=10
+            ) as client:
+
+                response = await client.post(
+                    f"{ML_SERVICE_URL}/predict",
+                    json={
+                        **ml_features,
+                        "rain_probability": rain_probability
+                    }
+                )
+
+                response.raise_for_status()
+
+                risk = response.json()
+
+                print(
+                    "V4 ML RESULT:",
+                    risk
+                )
+
+            risk["source"] = "V4_next_day_Nashik"
+
+        except Exception as error:
+
+            print(
+                "V4 ML service error:",
+                str(error)
+            )
+            print("Using rule-based fallback.")
+
+            risk = None
+
+    # --------------------------------------------------------
+    # RULE-BASED FALLBACK
+    # --------------------------------------------------------
+
+    if risk is None:
+
         if (
             rain_probability >= 70
             or rainfall >= 20
             or wind >= 45
         ):
+
             level = "High"
 
         elif (
@@ -948,14 +1723,19 @@ async def risk_node(state: State):
             or rainfall >= 5
             or wind >= 30
         ):
+
             level = "Medium"
 
         else:
+
             level = "Low"
 
         risk = {
             "risk_level": level,
-            "source": "fallback"
+            "risk_score": None,
+            "confidence": None,
+            "probabilities": {},
+            "source": "rule_based"
         }
 
     alert = None
@@ -964,36 +1744,39 @@ async def risk_node(state: State):
 
         alert = (
             f"High weather risk detected for "
-            f"{state['location']['name']} on "
-            f"{state['target_date']}. "
+            f"{state['location']['name']} "
+            f"on {state['target_date']}. "
             f"Expected rainfall is about "
             f"{rainfall:.0f} mm with a "
-            f"{rain_probability:.0f}% rain probability. "
-            f"Check updated local weather advisories."
+            f"{rain_probability:.0f}% "
+            f"rain probability. "
+            f"Check updated local weather "
+            f"advisories."
         )
 
     return {
-
         "features": features,
-
+        "ml_features": ml_features,
         "risk": risk,
-
         "alert": alert
     }
 
 
 # ============================================================
-# OUT-OF-SCOPE RESPONSE
+# NON-WEATHER RESPONSE
 # ============================================================
 
 def out_of_scope_response():
 
     return (
-        "I'm WeatherGPT, and this website is designed "
-        "specifically for weather-related information. "
-        "I can help with forecasts, rain, temperature, "
-        "wind, storms, climate, weather safety, travel "
-        "conditions and other weather-related questions."
+
+        "I'm WeatherGPT, and this website is "
+        "designed specifically for weather-related "
+        "information. I can help with forecasts, "
+        "rain, temperature, wind, storms, climate, "
+        "weather science, weather safety, travel "
+        "conditions and other weather-related "
+        "questions."
     )
 
 
@@ -1001,54 +1784,66 @@ def out_of_scope_response():
 # WEATHER KNOWLEDGE RESPONSE
 # ============================================================
 
-async def generate_weather_knowledge_response(
+async def weather_knowledge_response(
     state: State
 ):
 
     prompt = f"""
-You are WeatherGPT, an AI assistant specialized ONLY in weather.
+You are WeatherGPT.
 
-Answer the user's weather-related question clearly.
+You are a specialized weather assistant.
 
-This may be a conceptual weather question rather than
+Answer the user's weather-related question.
+
+This is a WEATHER KNOWLEDGE question, not necessarily
 a forecast question.
-
-Examples:
-
-- What causes thunderstorms?
-- What is El Niño?
-- How does monsoon work?
-- Why does humidity increase?
-- What is atmospheric pressure?
-- How are cyclones formed?
 
 USER QUESTION:
 {state["message"]}
 
+RECENT CONVERSATION:
+{state.get("history", [])}
+
 RULES:
 
-1. Answer only the weather-related question.
-2. Do not invent current weather data.
-3. Do not provide today's or tomorrow's weather unless
-   the user explicitly asks for a forecast.
-4. Do not force a forecast into the answer.
-5. Keep the explanation simple.
-6. Use examples when helpful.
-7. If the question is ambiguous, explain the weather-related
-   interpretation.
-8. Keep the answer around 3-6 sentences.
+1. Answer the actual question directly.
+
+2. Stay within weather, meteorology, climate,
+   atmospheric science and weather-related safety.
+
+3. Do NOT automatically provide today's weather.
+
+4. Do NOT automatically provide tomorrow's weather.
+
+5. Do NOT invent live weather information.
+
+6. If the user asks a conceptual question, explain
+   the concept clearly.
+
+7. If useful, give a simple real-world example.
+
+8. If the user asks a weather-related "why" question,
+   explain the reason.
+
+9. Keep the answer easy to understand.
+
+10. Do not say that you are a general-purpose assistant.
+
+11. Keep the answer around 3-6 sentences.
 """
 
-    result = await call_gemini(prompt)
+    result = await call_gemini(
+        prompt
+    )
 
     if result:
 
         return result
 
     return (
-        "That is a weather-related topic. "
-        "Please make sure your Gemini API is configured "
-        "to receive a detailed AI explanation."
+        "I can explain that weather-related topic, "
+        "but the AI explanation service is currently "
+        "unavailable."
     )
 
 
@@ -1056,48 +1851,57 @@ RULES:
 # FORECAST RESPONSE
 # ============================================================
 
-async def generate_forecast_response(
+async def forecast_response(
     state: State
 ):
 
-    location = state["location"]["name"]
-
-    target_date = state["target_date"]
-
-    features = state["features"]
-
-    risk_level = state["risk"].get(
-        "risk_level",
-        "Low"
+    location = (
+        state["location"]["name"]
     )
 
-    rainfall = features["rainfall"]
+    target_date = (
+        state["target_date"]
+    )
 
-    rain_probability = features[
-        "rain_probability"
-    ]
+    features = (
+        state["features"]
+    )
 
-    temperature = features[
-        "temperature"
-    ]
+    risk_level = (
+        state["risk"].get(
+            "risk_level",
+            "Low"
+        )
+    )
 
-    wind = features[
-        "wind_speed"
-    ]
+    rainfall = (
+        features["rainfall"]
+    )
 
-    humidity = features[
-        "humidity"
-    ]
+    rain_probability = (
+        features["rain_probability"]
+    )
 
-    pressure = features[
-        "pressure"
-    ]
+    temperature = (
+        features["temperature"]
+    )
+
+    wind = (
+        features["wind_speed"]
+    )
+
+    humidity = (
+        features["humidity"]
+    )
+
+    pressure = (
+        features["pressure"]
+    )
 
     prompt = f"""
 You are WeatherGPT, a conversational weather assistant.
 
-Answer the user's actual question using the supplied
-weather information.
+Answer the user's ACTUAL question.
 
 USER QUESTION:
 {state["message"]}
@@ -1109,86 +1913,78 @@ FORECAST DATE:
 {target_date}
 
 WEATHER DATA:
-Temperature: {temperature:.1f} °C
-Rain probability: {rain_probability:.0f} %
-Expected rainfall: {rainfall:.1f} mm
-Wind speed: {wind:.1f} km/h
-Humidity: {humidity:.0f} %
-Pressure: {pressure:.1f} hPa
 
-MACHINE LEARNING WEATHER RISK:
+Temperature:
+{temperature:.1f} °C
+
+Rain probability:
+{rain_probability:.0f} %
+
+Expected rainfall:
+{rainfall:.1f} mm
+
+Wind speed:
+{wind:.1f} km/h
+
+Humidity:
+{humidity:.0f} %
+
+Pressure:
+{pressure:.1f} hPa
+
+ML WEATHER RISK:
 {risk_level}
+
+RECENT CONVERSATION:
+{state.get("history", [])}
 
 RULES:
 
-1. Answer the user's actual question directly.
+1. Answer the user's actual question.
 
 2. Use ONLY the supplied weather values.
 
-3. Do not invent weather information.
+3. Never invent weather values.
 
-4. Do not answer with generic "today's weather"
-   unless the user asked about today.
+4. Never automatically answer with today's weather.
 
-5. Do not answer with tomorrow's weather unless
-   the question is actually about tomorrow.
+5. Never automatically answer with tomorrow's weather.
 
-6. If the question is about rain, focus on:
-   rain probability and expected rainfall.
+6. Use the correct forecast date.
 
-7. If the question is about temperature, focus on:
-   temperature.
+7. For rain questions, focus on rain probability
+   and expected rainfall.
 
-8. If the question is about wind, focus on:
-   wind speed.
+8. For temperature questions, focus on temperature.
 
-9. If the question involves travel, cycling, walking,
-   outdoor activities or safety, explain how the supplied
-   weather conditions affect the activity.
+9. For wind questions, focus on wind.
 
-10. If the question asks for a recommendation such as
-    whether an activity is suitable, base the explanation
-    on the weather conditions and ML risk level.
-    Do not pretend the ML model is a professional
+10. For travel, cycling, walking or outdoor questions,
+    explain how the weather conditions affect the activity.
+
+11. For comparisons, clearly compare the requested dates
+    only if the required data is available.
+
+12. For weather safety questions, use the weather values
+    and ML risk as supporting information.
+
+13. Do not claim the ML model is a professional
     meteorological warning system.
 
-11. If risk is High, recommend checking current local
-    weather advisories.
+14. If the risk is High, tell the user to check
+    current local weather advisories.
 
-12. Mention the forecast date when useful.
+15. Keep the response natural.
 
-13. Keep the response natural and concise.
+16. Usually answer in 2-5 sentences.
 
-14. Use previous conversation context when needed to
-    understand follow-up questions.
+17. Do not repeat the same generic response for every
+    question.
 """
 
-    # Add conversation history
-    history = state.get(
-        "history",
-        []
+    result = await call_gemini(
+        prompt
     )
-
-    if history:
-
-        history_text = "\n".join(
-            [
-                f"{item.get('role')}: {item.get('content')}"
-                for item in history[-6:]
-            ]
-        )
-
-        prompt += f"""
-
-RECENT CONVERSATION:
-
-{history_text}
-
-Use this only to understand context.
-Do not copy previous answers blindly.
-"""
-
-    result = await call_gemini(prompt)
 
     if result:
 
@@ -1206,34 +2002,42 @@ Do not copy previous answers blindly.
     if intent == "RAIN_FORECAST":
 
         return (
-            f"For {target_date} in {location}, "
-            f"the rain probability is around "
-            f"{rain_probability:.0f}% with expected "
-            f"rainfall of about {rainfall:.0f} mm."
+
+            f"For {target_date} in "
+            f"{location}, the rain probability "
+            f"is around "
+            f"{rain_probability:.0f}% with "
+            f"expected rainfall of about "
+            f"{rainfall:.0f} mm."
         )
 
     if intent == "TEMPERATURE":
 
         return (
-            f"On {target_date} in {location}, "
-            f"the forecast high is around "
+
+            f"On {target_date} in "
+            f"{location}, the forecast high "
+            f"is around "
             f"{temperature:.1f}°C."
         )
 
     if intent == "WIND":
 
         return (
-            f"On {target_date} in {location}, "
-            f"maximum wind speed is expected to be "
-            f"around {wind:.1f} km/h."
+
+            f"On {target_date} in "
+            f"{location}, maximum wind speed "
+            f"is expected to be around "
+            f"{wind:.1f} km/h."
         )
 
     return (
-        f"For {target_date} in {location}, "
-        f"the weather risk is {risk_level.lower()}. "
+
+        f"For {target_date} in "
+        f"{location}, the weather risk is "
+        f"{risk_level.lower()}. "
         f"Rain probability is around "
-        f"{rain_probability:.0f}% and expected rainfall "
-        f"is approximately {rainfall:.0f} mm."
+        f"{rain_probability:.0f}%."
     )
 
 
@@ -1241,11 +2045,13 @@ Do not copy previous answers blindly.
 # RESPONSE NODE
 # ============================================================
 
-async def response_node(state: State):
+async def response_node(
+    state: State
+):
 
     scope = state.get(
         "scope",
-        "weather"
+        "non_weather"
     )
 
     query_type = state.get(
@@ -1261,9 +2067,11 @@ async def response_node(state: State):
 
         return {
 
-            "response": out_of_scope_response(),
+            "response":
+                out_of_scope_response(),
 
-            "is_weather_related": False
+            "is_weather_related":
+                False
         }
 
     # --------------------------------------------------------
@@ -1273,39 +2081,45 @@ async def response_node(state: State):
     if query_type == "weather_knowledge":
 
         response = (
-            await generate_weather_knowledge_response(
+            await weather_knowledge_response(
                 state
             )
         )
 
         return {
 
-            "response": response,
+            "response":
+                response,
 
-            "is_weather_related": True
+            "is_weather_related":
+                True
         }
 
     # --------------------------------------------------------
     # FORECAST
     # --------------------------------------------------------
 
-    response = await generate_forecast_response(
+    response = await forecast_response(
         state
     )
 
     return {
 
-        "response": response,
+        "response":
+            response,
 
-        "is_weather_related": True
+        "is_weather_related":
+            True
     }
 
 
 # ============================================================
-# LANGGRAPH WORKFLOW
+# LANGGRAPH
 # ============================================================
 
-workflow = StateGraph(State)
+workflow = StateGraph(
+    State
+)
 
 workflow.add_node(
     "query_understanding",
@@ -1334,33 +2148,48 @@ workflow.add_edge(
 )
 
 
-# ------------------------------------------------------------
-# IMPORTANT:
-#
-# Non-weather questions skip weather API + ML completely.
-#
-# Weather knowledge questions also skip forecast + ML.
-# ------------------------------------------------------------
+# ============================================================
+# CONDITIONAL ROUTING
+# ============================================================
 
-def route_after_query(state: State):
+def route_after_query(
+    state: State
+):
 
-    if state.get("scope") == "non_weather":
-
-        return "response_generation"
-
-    if state.get("query_type") == "weather_knowledge":
+    # Non-weather:
+    # go directly to response.
+    if state.get(
+        "scope"
+    ) == "non_weather":
 
         return "response_generation"
 
+    # Weather knowledge:
+    # no need for forecast or ML.
+    if state.get(
+        "query_type"
+    ) == "weather_knowledge":
+
+        return "response_generation"
+
+    # Forecast:
+    # fetch weather and use ML.
     return "weather_data"
 
 
 workflow.add_conditional_edges(
+
     "query_understanding",
+
     route_after_query,
+
     {
-        "weather_data": "weather_data",
-        "response_generation": "response_generation"
+
+        "weather_data":
+            "weather_data",
+
+        "response_generation":
+            "response_generation"
     }
 )
 
@@ -1385,7 +2214,7 @@ graph = workflow.compile()
 
 
 # ============================================================
-# HEALTH CHECK
+# HEALTH
 # ============================================================
 
 @app.get("/health")
@@ -1397,81 +2226,103 @@ def health():
 
         "langgraph": True,
 
-        "gemini_configured": bool(
-            GEMINI_API_KEY
-        ),
+        "gemini_configured":
+            bool(GEMINI_API_KEY),
 
-        "model": GEMINI_MODEL
+        "model":
+            GEMINI_MODEL
     }
 
 
 # ============================================================
-# CHAT ENDPOINT
+# CHAT
 # ============================================================
 
 @app.post("/chat")
-async def chat(req: ChatRequest):
+async def chat(
+    req: ChatRequest
+):
 
     result = await graph.ainvoke(
+
         {
-            "message": req.message,
 
-            "city": req.city,
+            "message":
+                req.message,
 
-            "history": req.history
+            "city":
+                req.city,
+
+            "history":
+                req.history
         }
     )
 
     return {
 
-        "response": result.get(
-            "response",
-            ""
-        ),
+        "response":
+            result.get(
+                "response",
+                ""
+            ),
 
-        "location": result.get(
-            "location"
-        ),
+        "location":
+            result.get(
+                "location"
+            ),
 
-        "weather": result.get(
-            "weather"
-        ),
+        "weather":
+            result.get(
+                "weather"
+            ),
 
-        "risk": result.get(
-            "risk"
-        ),
+        "risk":
+            result.get(
+                "risk"
+            ),
 
-        "alert": result.get(
-            "alert"
-        ),
+        "alert":
+            result.get(
+                "alert"
+            ),
 
-        "intent": result.get(
-            "intent"
-        ),
+        "intent":
+            result.get(
+                "intent"
+            ),
 
-        "target_date": result.get(
-            "target_date"
-        ),
+        "target_date":
+            result.get(
+                "target_date"
+            ),
 
-        "forecast_index": result.get(
-            "forecast_index"
-        ),
+        "forecast_index":
+            result.get(
+                "forecast_index"
+            ),
 
-        "features": result.get(
-            "features"
-        ),
+        "features":
+            result.get(
+                "features"
+            ),
 
-        "is_weather_related": result.get(
-            "is_weather_related",
-            True
-        ),
+        "ml_features":
+            result.get(
+                "ml_features"
+            ),
 
-        "query_type": result.get(
-            "query_type"
-        ),
+        "is_weather_related":
+            result.get(
+                "is_weather_related",
+                False
+            ),
 
-        "timestamp": (
+        "query_type":
+            result.get(
+                "query_type"
+            ),
+
+        "timestamp":
             datetime.utcnow().isoformat()
             + "Z"
-        )
     }
